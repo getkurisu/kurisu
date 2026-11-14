@@ -4,7 +4,7 @@
 # daemon-less file path: we flip the pending request with `ku`-free jq if no daemon.)
 set -euo pipefail
 KU=${KU:-ku}; PORT=${PORT:-18793}; B=http://127.0.0.1:$PORT
-H=$(mktemp -d "${TMPDIR:-/run/media/deck/SDCARD/distrobox/omni/dev/tmp}/qa-oauth.XXXX")
+H=$(mktemp -d "${TMPDIR:?set TMPDIR to a writable scratch folder}/qa-oauth.XXXX")
 export KURISU_HOME=$H
 "$KU" mcp serve --host 127.0.0.1 --port $PORT >"$H/serve.log" 2>&1 & SP=$!
 trap 'kill $SP 2>/dev/null' EXIT; sleep 1
