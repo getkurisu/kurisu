@@ -47,7 +47,7 @@ use axum::body::Bytes;
 use axum::extract::{Path as AxPath, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -73,6 +73,8 @@ struct Ctx {
     home: PathBuf,
     token: Arc<String>,
     allowed_hosts: Arc<Vec<String>>,
+    /// `http://<bound addr>`: issuer, resource and endpoint URLs hang off it.
+    base: Arc<String>,
 }
 
 impl Ctx {
@@ -209,7 +211,14 @@ pub fn status_text(st: &Value) -> String {
         (Some(path), None) => format!("{path} (not created yet)"),
         _ => "unknown".into(),
     };
-    lines.push(format!("token: {token}"));
+    if let Some(u) = st["sign_in_url"].as_str().filter(|u| !u.is_empty()) {
+        lines.push(format!("url: {u}"));
+        lines.push("  paste it into any MCP client; it opens a sign-in you approve here".into());
+    }
+    let clients = st["oauth_clients"].as_array().cloned().unwrap_or_default();
+    let names: Vec<String> = clients.iter().map(|c| c["client_name"].as_str().unwrap_or("?").to_string()).collect();
+    lines.push(format!("signed-in clients: {}", if names.is_empty() { "none".to_string() } else { names.join(", ") }));
+    lines.push(format!("legacy secret file: {token}"));
     if listening {
         let pid = st["pid"].as_u64().unwrap_or(0);
         lines.push(format!("pid: {pid} (the daemon)"));
@@ -218,7 +227,7 @@ pub fn status_text(st: &Value) -> String {
         }
     }
     if let Some(url) = st["url"].as_str().filter(|u| !u.is_empty()) {
-        lines.push(format!("url: {url}"));
+        lines.push(format!("legacy URL (no sign-in): {url}"));
     }
     if let Some(note) = st["note"].as_str().filter(|n| !n.trim().is_empty()) {
         lines.push(format!("note: {note}"));
@@ -226,7 +235,7 @@ pub fn status_text(st: &Value) -> String {
     lines.extend([
         String::new(),
         if listening {
-            "The URL is masked. Show URL sends the full one in its own message.".into()
+            "The legacy URL is masked; Show URL sends it in full. Sign out removes a client's sign-in.".into()
         } else {
             "Enable starts it inside the daemon; a restart with it enabled brings it back.".into()
         },
@@ -234,7 +243,8 @@ pub fn status_text(st: &Value) -> String {
     lines.join("\n")
 }
 
-/// Enable (when stopped) or Disable (when running), plus Show URL. `msv:` is
+/// Enable (when stopped) or Disable (when running), plus Show URL and one
+/// Sign out button per signed-in OAuth client. `msv:` is
 /// this card's callback prefix. `st` is the `mcp_server_status` reply.
 pub fn keyboard(st: &Value) -> Value {
     let toggle = if st["listening"] == json!(true) {
@@ -242,7 +252,13 @@ pub fn keyboard(st: &Value) -> Value {
     } else {
         json!({"text": "▶️ Enable", "callback_data": "msv:on"})
     };
-    json!({"inline_keyboard": [[toggle, {"text": "🔗 Show URL", "callback_data": "msv:url"}]]})
+    let mut rows = vec![json!([toggle, {"text": "🔗 Show URL", "callback_data": "msv:url"}])];
+    for c in st["oauth_clients"].as_array().into_iter().flatten().take(4) {
+        let (Some(id), name) = (c["client_id"].as_str(), c["client_name"].as_str().unwrap_or("client")) else { continue };
+        let short: String = name.chars().take(24).collect();
+        rows.push(json!([{"text": format!("🚫 Sign out {short}"), "callback_data": format!("msv:rv:{id}")}]));
+    }
+    json!({"inline_keyboard": rows})
 }
 
 // ------------------------------------------------------------------ auth
@@ -262,21 +278,588 @@ fn host_ok(allowed: &[String], h: &HeaderMap) -> bool {
     allowed.is_empty() || allowed.iter().any(|a| a == host)
 }
 
-/// The token in the URL or in `Authorization: Bearer`; either one is enough.
+/// The static secret in the URL or in `Authorization: Bearer` (unchanged), or an
+/// unexpired OAuth access token as a bearer. Anything else is 401 with the
+/// `WWW-Authenticate` header that starts a stock client's sign-in.
 fn authorize(ctx: &Ctx, h: &HeaderMap, path_token: Option<&str>) -> Result<(), Response> {
     if !host_ok(&ctx.allowed_hosts, h) {
         return Err(refused(StatusCode::FORBIDDEN, "unexpected Host header"));
     }
-    let header_ok = bearer(h).is_some_and(|t| ct_eq(t, &ctx.token));
+    let header_ok = bearer(h).is_some_and(|t| ct_eq(t, &ctx.token) || oauth_token_ok(&ctx.home, t));
     let path_ok = path_token.is_some_and(|t| ct_eq(t, &ctx.token));
     if !header_ok && !path_ok {
-        return Err(refused(StatusCode::UNAUTHORIZED, "missing or wrong token"));
+        return Err(unauthorized(ctx, "sign-in required (missing, wrong or expired token)"));
     }
     Ok(())
 }
 
 fn refused(status: StatusCode, why: &str) -> Response {
     (status, Json(json!({"error": why}))).into_response()
+}
+
+// ------------------------------------------------------------------ OAuth (MCP auth 2025-06-18)
+//
+// A stock MCP client pastes the bare `/mcp` URL, gets 401 + `resource_metadata`,
+// discovers this server as its own authorization server, registers itself
+// (RFC 7591, public client), and opens `/authorize` in the owner's browser with
+// PKCE S256. The owner approves on a Telegram card; the waiting page polls and
+// then navigates to the client's (loopback) redirect_uri with the code, so the
+// code never passes through Telegram. `/token` swaps it for an opaque bearer.
+//
+// All state is in 0600 JSON files under the home, so the Telegram decision (in
+// the daemon) reaches a foreground `ku mcp serve` listener too.
+
+pub const CLIENTS_FILE: &str = "mcp-server-clients.json";
+pub const TOKENS_FILE: &str = "mcp-server-oauth-tokens.json";
+pub const PENDING_FILE: &str = "mcp-server-oauth-pending.json";
+pub const OAUTH_SCOPE: &str = "mcp";
+/// How long the owner has to tap Approve.
+const PENDING_SECS: i64 = 600;
+/// Life of an authorization code once approved.
+const CODE_SECS: i64 = 300;
+const ACCESS_SECS: i64 = 3600;
+const REFRESH_SECS: i64 = 30 * 86400;
+/// Open sign-in requests at once: more is someone spamming the owner's chat.
+const MAX_PENDING: usize = 5;
+const MAX_CLIENTS: usize = 200;
+
+/// Serialises read-modify-write of the OAuth files inside this process.
+static OAUTH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn now_s() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut b = vec![0u8; bytes];
+    rand::rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Tokens are stored hashed: the file says who is signed in, never lets anyone sign in.
+fn token_hash(t: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(t.as_bytes()).iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn read_obj(home: &Path, file: &str) -> serde_json::Map<String, Value> {
+    std::fs::read(home.join(file)).ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn write_obj(home: &Path, file: &str, v: &serde_json::Map<String, Value>) -> Result<()> {
+    crate::telegram::write_private(&home.join(file), &serde_json::to_vec_pretty(v)?)
+}
+
+/// Run `f` on one OAuth file under the lock and write it back.
+fn with_file<T>(home: &Path, file: &str, f: impl FnOnce(&mut serde_json::Map<String, Value>) -> T) -> Result<T> {
+    let _g = OAUTH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut m = read_obj(home, file);
+    let out = f(&mut m);
+    write_obj(home, file, &m)?;
+    Ok(out)
+}
+
+fn base_url(ctx: &Ctx) -> String {
+    ctx.base.to_string()
+}
+
+fn resource_url(ctx: &Ctx) -> String {
+    format!("{}/mcp", ctx.base)
+}
+
+fn www_authenticate(ctx: &Ctx) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"", ctx.base))
+        .unwrap_or_else(|_| HeaderValue::from_static("Bearer"))
+}
+
+/// 401 for /mcp: the header tells a stock client where to start signing in.
+fn unauthorized(ctx: &Ctx, why: &str) -> Response {
+    let mut r = refused(StatusCode::UNAUTHORIZED, why);
+    r.headers_mut().insert(header::WWW_AUTHENTICATE, www_authenticate(ctx));
+    r
+}
+
+/// Is this an unexpired OAuth access token?
+fn oauth_token_ok(home: &Path, token: &str) -> bool {
+    let h = token_hash(token);
+    let now = now_s();
+    read_obj(home, TOKENS_FILE).values()
+        .any(|t| t["access_hash"].as_str() == Some(h.as_str()) && t["expires_at"].as_i64().unwrap_or(0) > now)
+}
+
+fn oauth_error(status: StatusCode, err: &str, desc: &str) -> Response {
+    let mut r = (status, Json(json!({"error": err, "error_description": desc}))).into_response();
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+/// `application/x-www-form-urlencoded` (or a query string) into pairs; the last value wins.
+fn form_decode(raw: &str) -> std::collections::HashMap<String, String> {
+    fn dec(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'+' => out.push(b' '),
+                b'%' if i + 2 < b.len() => {
+                    match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                        Ok(v) => { out.push(v); i += 2; }
+                        Err(_) => out.push(b'%'),
+                    }
+                }
+                c => out.push(c),
+            }
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    raw.split('&').filter(|p| !p.is_empty()).map(|p| {
+        let (k, v) = p.split_once('=').unwrap_or((p, ""));
+        (dec(k), dec(v))
+    }).collect()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+/// (scheme, host, port, path) of an http(s) URL, without pulling in a URL crate.
+fn split_url(u: &str) -> Option<(String, String, Option<u16>, String)> {
+    let (scheme, rest) = u.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let (auth, path) = match rest.find(['/', '?', '#']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if auth.is_empty() || auth.contains('@') {
+        return None;
+    }
+    let (host, port) = if let Some(r) = auth.strip_prefix('[') {
+        let (h, tail) = r.split_once(']')?;
+        (format!("[{h}]"), tail.strip_prefix(':'))
+    } else {
+        match auth.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), Some(p)),
+            None => (auth.to_string(), None),
+        }
+    };
+    let port = match port {
+        Some(p) => Some(p.parse::<u16>().ok()?),
+        None => None,
+    };
+    Some((scheme, host.to_ascii_lowercase(), port, path.to_string()))
+}
+
+fn is_loopback_host(h: &str) -> bool {
+    matches!(h, "127.0.0.1" | "localhost" | "[::1]")
+}
+
+/// A redirect a public client may register: https anywhere, http only on loopback.
+fn redirect_allowed(u: &str) -> bool {
+    match split_url(u) {
+        Some((s, h, _, _)) => !u.contains('#') && (s == "https" || is_loopback_host(&h)),
+        None => false,
+    }
+}
+
+/// The requested redirect against the registered ones: exact, or for loopback
+/// the same host and path on any port (RFC 8252 §7.3: native apps pick a free port).
+fn redirect_matches(registered: &[String], asked: &str) -> bool {
+    if registered.iter().any(|r| r == asked) {
+        return true;
+    }
+    let Some((s, h, _, p)) = split_url(asked) else { return false };
+    if s != "http" || !is_loopback_host(&h) {
+        return false;
+    }
+    registered.iter().any(|r| matches!(split_url(r), Some((rs, rh, _, rp)) if rs == s && rh == h && rp == p))
+}
+
+fn redirect_host(u: &str) -> String {
+    match split_url(u) {
+        Some((_, h, Some(p), _)) => format!("{h}:{p}"),
+        Some((_, h, None, _)) => h,
+        None => "?".into(),
+    }
+}
+
+fn with_query(uri: &str, fields: &[(&str, &str)]) -> String {
+    let fields: Vec<(&str, &str)> = fields.iter().filter(|(_, v)| !v.is_empty()).copied().collect();
+    let sep = if uri.contains('?') { '&' } else { '?' };
+    format!("{uri}{sep}{}", crate::oauth::form_encode(&fields))
+}
+
+fn protected_resource_doc(ctx: &Ctx) -> Value {
+    json!({
+        "resource": resource_url(ctx),
+        "authorization_servers": [base_url(ctx)],
+        "scopes_supported": [OAUTH_SCOPE],
+        "bearer_methods_supported": ["header"],
+        "resource_name": "Kurisu",
+    })
+}
+
+fn authorization_server_doc(ctx: &Ctx) -> Value {
+    let b = base_url(ctx);
+    json!({
+        "issuer": b,
+        "authorization_endpoint": format!("{b}/authorize"),
+        "token_endpoint": format!("{b}/token"),
+        "registration_endpoint": format!("{b}/register"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": [OAUTH_SCOPE],
+    })
+}
+
+async fn well_known_resource(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
+    if !host_ok(&ctx.allowed_hosts, &h) {
+        return refused(StatusCode::FORBIDDEN, "unexpected Host header");
+    }
+    json_response(protected_resource_doc(&ctx))
+}
+
+async fn well_known_as(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
+    if !host_ok(&ctx.allowed_hosts, &h) {
+        return refused(StatusCode::FORBIDDEN, "unexpected Host header");
+    }
+    json_response(authorization_server_doc(&ctx))
+}
+
+/// RFC 7591 dynamic registration, public clients only (no secret is issued).
+async fn register(State(ctx): State<Ctx>, h: HeaderMap, body: Bytes) -> Response {
+    if !host_ok(&ctx.allowed_hosts, &h) {
+        return refused(StatusCode::FORBIDDEN, "unexpected Host header");
+    }
+    let bad = |d: &str| (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_client_metadata", "error_description": d}))).into_response();
+    let Ok(meta) = serde_json::from_slice::<Value>(&body) else { return bad("body must be a JSON object") };
+    let uris: Vec<String> = meta["redirect_uris"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+    if uris.is_empty() || uris.len() > 10 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_redirect_uri", "error_description": "1 to 10 redirect_uris are required"}))).into_response();
+    }
+    if let Some(u) = uris.iter().find(|u| !redirect_allowed(u)) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_redirect_uri",
+            "error_description": format!("{u}: only https, or http on 127.0.0.1/localhost/[::1], is allowed")}))).into_response();
+    }
+    if let Some(m) = meta["token_endpoint_auth_method"].as_str() {
+        if m != "none" {
+            return bad("only public clients (token_endpoint_auth_method none) are supported");
+        }
+    }
+    let name: String = meta["client_name"].as_str().map(str::trim).filter(|s| !s.is_empty())
+        .unwrap_or("MCP client").chars().filter(|c| !c.is_control()).take(80).collect();
+    let client_id = random_hex(16);
+    let rec = json!({"client_name": name, "redirect_uris": uris, "created_at": now_s()});
+    let saved = with_file(&ctx.home, CLIENTS_FILE, |m| {
+        if m.len() >= MAX_CLIENTS {
+            // Drop the oldest registration; a real client simply registers again.
+            if let Some(old) = m.iter().min_by_key(|(_, v)| v["created_at"].as_i64().unwrap_or(0)).map(|(k, _)| k.clone()) {
+                m.remove(&old);
+            }
+        }
+        m.insert(client_id.clone(), rec);
+    });
+    if let Err(e) = saved {
+        return refused(StatusCode::INTERNAL_SERVER_ERROR, &format!("could not save the registration: {e}"));
+    }
+    let mut r = (StatusCode::CREATED, Json(json!({
+        "client_id": client_id,
+        "client_id_issued_at": now_s(),
+        "client_name": name,
+        "redirect_uris": uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "scope": OAUTH_SCOPE,
+    }))).into_response();
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+fn html_page(status: StatusCode, title: &str, body: &str) -> Response {
+    let page = format!("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>{t}</title><style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5}}</style></head>\
+<body>{body}</body></html>", t = html_escape(title));
+    let mut r = (status, page).into_response();
+    let hd = r.headers_mut();
+    hd.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    hd.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    hd.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    r
+}
+
+fn redirect_to(uri: &str) -> Response {
+    let mut r = StatusCode::FOUND.into_response();
+    if let Ok(v) = HeaderValue::from_str(uri) {
+        r.headers_mut().insert(header::LOCATION, v);
+    }
+    r
+}
+
+/// GET /authorize: check the request, open a pending sign-in, ask the owner on
+/// Telegram (in the background), and answer a page that waits for the decision.
+async fn authorize_get(State(ctx): State<Ctx>, h: HeaderMap, uri: axum::http::Uri) -> Response {
+    if !host_ok(&ctx.allowed_hosts, &h) {
+        return refused(StatusCode::FORBIDDEN, "unexpected Host header");
+    }
+    let q = form_decode(uri.query().unwrap_or(""));
+    let get = |k: &str| q.get(k).cloned().unwrap_or_default();
+    let client_id = get("client_id");
+    let clients = read_obj(&ctx.home, CLIENTS_FILE);
+    // Unknown client or redirect: never redirect (RFC 6749 §4.1.2.1), show the error here.
+    let Some(client) = clients.get(&client_id) else {
+        return html_page(StatusCode::BAD_REQUEST, "Sign-in failed", "<p>Unknown client_id. The client must register first.</p>");
+    };
+    let registered: Vec<String> = client["redirect_uris"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+    let redirect_uri = match q.get("redirect_uri") {
+        Some(r) => r.clone(),
+        None if registered.len() == 1 => registered[0].clone(),
+        None => return html_page(StatusCode::BAD_REQUEST, "Sign-in failed", "<p>redirect_uri is required.</p>"),
+    };
+    if !redirect_matches(&registered, &redirect_uri) {
+        return html_page(StatusCode::BAD_REQUEST, "Sign-in failed", "<p>redirect_uri is not registered for this client.</p>");
+    }
+    let state = get("state");
+    let fail = |err: &str, desc: &str| redirect_to(&with_query(&redirect_uri, &[("error", err), ("error_description", desc), ("state", &state)]));
+    if get("response_type") != "code" {
+        return fail("unsupported_response_type", "only response_type=code is supported");
+    }
+    let challenge = get("code_challenge");
+    if challenge.len() < 43 || challenge.len() > 128 || get("code_challenge_method") != "S256" {
+        return fail("invalid_request", "PKCE with code_challenge_method=S256 is required");
+    }
+    if let Some(res) = q.get("resource") {
+        let want = resource_url(&ctx);
+        if res.trim_end_matches('/') != want && res.trim_end_matches('/') != base_url(&ctx) {
+            return fail("invalid_target", "resource must be this server's /mcp URL");
+        }
+    }
+    let scope = match q.get("scope").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        None => OAUTH_SCOPE.to_string(),
+        Some(s) if s.split_whitespace().all(|x| x == OAUTH_SCOPE) => OAUTH_SCOPE.to_string(),
+        Some(_) => return fail("invalid_scope", "the only scope is mcp"),
+    };
+    let name = client["client_name"].as_str().unwrap_or("MCP client").to_string();
+    let id = random_hex(16);
+    let now = now_s();
+    let rec = json!({"client_id": client_id, "client_name": name, "redirect_uri": redirect_uri,
+                     "redirect_given": q.contains_key("redirect_uri"), "state": state,
+                     "code_challenge": challenge, "scope": scope, "created_at": now,
+                     "expires_at": now + PENDING_SECS, "decision": "pending"});
+    let opened = with_file(&ctx.home, PENDING_FILE, |m| {
+        prune_pending(m, now);
+        if m.values().filter(|p| p["decision"] == "pending").count() >= MAX_PENDING {
+            return false;
+        }
+        m.insert(id.clone(), rec);
+        true
+    });
+    match opened {
+        Ok(true) => {}
+        Ok(false) => return html_page(StatusCode::TOO_MANY_REQUESTS, "Too many sign-ins",
+            "<p>Too many sign-in requests are waiting. Answer or let them expire, then try again.</p>"),
+        Err(e) => return refused(StatusCode::INTERNAL_SERVER_ERROR, &format!("could not save the request: {e}")),
+    }
+    // The card goes out in the background: the page and the daemon never wait on Telegram.
+    let card = json!({"op": "mcp_oauth_card", "id": id, "client_name": name,
+                      "redirect_host": redirect_host(&redirect_uri), "scope": scope, "expires_at": now + PENDING_SECS});
+    let c2 = ctx.clone();
+    let id2 = id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = call_daemon(&c2, card).await {
+            let _ = with_file(&c2.home, PENDING_FILE, |m| {
+                if let Some(p) = m.get_mut(&id2) { p["card_error"] = json!(e); }
+            });
+        }
+    });
+    let body = format!(
+        "<h2>Approve in Telegram</h2><p>Kurisu is asking you to approve <b>{n}</b>. Tap Approve in Telegram.</p>\
+<p id=\"s\">Waiting for your answer… (expires in 10 minutes)</p>\
+<script>const id={id:?};async function t(){{try{{const r=await fetch('/authorize/poll/'+id,{{cache:'no-store'}});const j=await r.json();\
+if(j.redirect){{document.getElementById('s').textContent=j.state==='approved'?'Approved. Returning to the app…':'Denied.';location.replace(j.redirect);return}}\
+if(j.state==='expired'){{document.getElementById('s').textContent='This request expired. Start the sign-in again.';return}}\
+if(j.error){{document.getElementById('s').textContent='Could not ask Telegram: '+j.error}}}}catch(e){{}}setTimeout(t,1000)}}t();</script>",
+        n = html_escape(&name));
+    html_page(StatusCode::OK, "Approve in Telegram", &body)
+}
+
+/// Drop expired requests and used/expired codes.
+fn prune_pending(m: &mut serde_json::Map<String, Value>, now: i64) {
+    m.retain(|_, p| match p["decision"].as_str() {
+        Some("approved") => p["code_expires_at"].as_i64().unwrap_or(0) > now,
+        _ => p["expires_at"].as_i64().unwrap_or(0) > now,
+    });
+}
+
+/// GET /authorize/poll/<id>: where the waiting page goes next.
+async fn authorize_poll(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>) -> Response {
+    if !host_ok(&ctx.allowed_hosts, &h) {
+        return refused(StatusCode::FORBIDDEN, "unexpected Host header");
+    }
+    let now = now_s();
+    let p = read_obj(&ctx.home, PENDING_FILE).get(&id).cloned();
+    let Some(p) = p else { return json_response(json!({"state": "expired", "redirect": null})) };
+    let uri = p["redirect_uri"].as_str().unwrap_or("");
+    let state = p["state"].as_str().unwrap_or("");
+    let out = match p["decision"].as_str() {
+        Some("approved") if p["code_expires_at"].as_i64().unwrap_or(0) > now => json!({"state": "approved",
+            "redirect": with_query(uri, &[("code", p["code"].as_str().unwrap_or("")), ("state", state)])}),
+        Some("denied") => json!({"state": "denied",
+            "redirect": with_query(uri, &[("error", "access_denied"), ("error_description", "the owner denied the sign-in"), ("state", state)])}),
+        Some("pending") if p["expires_at"].as_i64().unwrap_or(0) > now => {
+            let mut v = json!({"state": "pending", "redirect": null});
+            if let Some(e) = p["card_error"].as_str() { v["error"] = json!(e); }
+            v
+        }
+        _ => json!({"state": "expired", "redirect": null}),
+    };
+    json_response(out)
+}
+
+/// The owner's answer from Telegram. Returns the client name, or an error when
+/// the request is unknown, expired or already answered.
+pub fn oauth_decide(home: &Path, id: &str, approve: bool) -> Result<String> {
+    let now = now_s();
+    with_file(home, PENDING_FILE, |m| {
+        prune_pending(m, now);
+        let p = m.get_mut(id).ok_or_else(|| anyhow::anyhow!("this sign-in request expired"))?;
+        if p["decision"] != "pending" {
+            anyhow::bail!("this sign-in request was already answered");
+        }
+        if approve {
+            p["decision"] = json!("approved");
+            p["code"] = json!(random_hex(32));
+            p["code_expires_at"] = json!(now + CODE_SECS);
+        } else {
+            p["decision"] = json!("denied");
+        }
+        Ok(p["client_name"].as_str().unwrap_or("MCP client").to_string())
+    })?
+}
+
+fn issue_tokens(home: &Path, client_id: &str, client_name: &str, scope: &str) -> Result<Value> {
+    let access = random_hex(32);
+    let refresh = random_hex(32);
+    let now = now_s();
+    with_file(home, TOKENS_FILE, |m| {
+        m.retain(|_, t| t["refresh_expires_at"].as_i64().unwrap_or(0) > now);
+        m.insert(random_hex(8), json!({"client_id": client_id, "client_name": client_name, "scope": scope,
+            "access_hash": token_hash(&access), "refresh_hash": token_hash(&refresh),
+            "issued_at": now, "expires_at": now + ACCESS_SECS, "refresh_expires_at": now + REFRESH_SECS}));
+    })?;
+    Ok(json!({"access_token": access, "token_type": "Bearer", "expires_in": ACCESS_SECS,
+              "refresh_token": refresh, "scope": scope}))
+}
+
+/// POST /token: authorization_code (PKCE S256) and refresh_token grants.
+async fn token_post(State(ctx): State<Ctx>, h: HeaderMap, body: Bytes) -> Response {
+    if !host_ok(&ctx.allowed_hosts, &h) {
+        return refused(StatusCode::FORBIDDEN, "unexpected Host header");
+    }
+    let f = form_decode(&String::from_utf8_lossy(&body));
+    let get = |k: &str| f.get(k).cloned().unwrap_or_default();
+    let client_id = get("client_id");
+    let clients = read_obj(&ctx.home, CLIENTS_FILE);
+    let Some(client) = clients.get(&client_id) else {
+        return oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "unknown client_id");
+    };
+    let name = client["client_name"].as_str().unwrap_or("MCP client").to_string();
+    let now = now_s();
+    match get("grant_type").as_str() {
+        "authorization_code" => {
+            let code = get("code");
+            if code.is_empty() || get("code_verifier").is_empty() {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "code and code_verifier are required");
+            }
+            // Single use: the code is taken out whatever happens next.
+            let taken = with_file(&ctx.home, PENDING_FILE, |m| {
+                prune_pending(m, now);
+                let key = m.iter().find(|(_, p)| p["decision"] == "approved"
+                    && p["code"].as_str().is_some_and(|c| ct_eq(c, &code))).map(|(k, _)| k.clone())?;
+                m.remove(&key)
+            });
+            let p = match taken {
+                Ok(Some(p)) => p,
+                Ok(None) => return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "unknown, used or expired code"),
+                Err(e) => return refused(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
+            };
+            if p["client_id"].as_str() != Some(client_id.as_str()) {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "the code was issued to another client");
+            }
+            let asked = get("redirect_uri");
+            let want = p["redirect_uri"].as_str().unwrap_or("");
+            if (p["redirect_given"] == json!(true) || !asked.is_empty()) && asked != want {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "redirect_uri does not match the authorization request");
+            }
+            let challenge = crate::oauth::pkce_challenge(&get("code_verifier"));
+            if !ct_eq(&challenge, p["code_challenge"].as_str().unwrap_or("")) {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "code_verifier does not match the code_challenge");
+            }
+            match issue_tokens(&ctx.home, &client_id, &name, p["scope"].as_str().unwrap_or(OAUTH_SCOPE)) {
+                Ok(v) => json_response(v),
+                Err(e) => refused(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
+            }
+        }
+        "refresh_token" => {
+            let rh = token_hash(&get("refresh_token"));
+            // Rotation: the old pair is gone once the new one is issued.
+            let old = with_file(&ctx.home, TOKENS_FILE, |m| {
+                let key = m.iter().find(|(_, t)| t["refresh_hash"].as_str() == Some(rh.as_str())
+                    && t["refresh_expires_at"].as_i64().unwrap_or(0) > now).map(|(k, _)| k.clone())?;
+                m.remove(&key)
+            });
+            let t = match old {
+                Ok(Some(t)) => t,
+                Ok(None) => return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "unknown or expired refresh_token"),
+                Err(e) => return refused(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
+            };
+            if t["client_id"].as_str() != Some(client_id.as_str()) {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "the refresh_token belongs to another client");
+            }
+            match issue_tokens(&ctx.home, &client_id, &name, t["scope"].as_str().unwrap_or(OAUTH_SCOPE)) {
+                Ok(v) => json_response(v),
+                Err(e) => refused(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
+            }
+        }
+        "" => oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "grant_type is required"),
+        _ => oauth_error(StatusCode::BAD_REQUEST, "unsupported_grant_type", "authorization_code or refresh_token"),
+    }
+}
+
+/// Signed-in clients for the status card: one row per client with a live refresh token.
+pub fn oauth_clients(home: &Path) -> Value {
+    let now = now_s();
+    let mut by: std::collections::BTreeMap<String, (String, i64)> = Default::default();
+    for t in read_obj(home, TOKENS_FILE).values() {
+        if t["refresh_expires_at"].as_i64().unwrap_or(0) <= now {
+            continue;
+        }
+        let id = t["client_id"].as_str().unwrap_or("").to_string();
+        let e = by.entry(id).or_insert((t["client_name"].as_str().unwrap_or("").to_string(), 0));
+        e.1 = e.1.max(t["issued_at"].as_i64().unwrap_or(0));
+    }
+    Value::Array(by.into_iter().map(|(id, (name, at))| json!({"client_id": id, "client_name": name, "last_sign_in": at})).collect())
+}
+
+/// Sign a client out: its tokens are deleted (it must be approved again).
+/// `None` signs every client out. Answers how many token pairs were removed.
+pub fn oauth_revoke(home: &Path, client_id: Option<&str>) -> Result<usize> {
+    with_file(home, TOKENS_FILE, |m| {
+        let before = m.len();
+        m.retain(|_, t| client_id.is_some_and(|c| t["client_id"].as_str() != Some(c)));
+        before - m.len()
+    })
 }
 
 // ------------------------------------------------------------------ tools
@@ -531,11 +1114,20 @@ fn allowed_hosts(bound: SocketAddr) -> Vec<String> {
 }
 
 pub fn router(home: PathBuf, token: String, bound: SocketAddr) -> Router {
-    let ctx = Ctx { home, token: Arc::new(token), allowed_hosts: Arc::new(allowed_hosts(bound)) };
+    let ctx = Ctx { home, token: Arc::new(token), allowed_hosts: Arc::new(allowed_hosts(bound)),
+                    base: Arc::new(format!("http://{bound}")) };
     Router::new()
         .route("/mcp", post(rpc_header).get(no_stream_header))
         .route("/mcp/", post(rpc_header))
         .route("/mcp/{token}", post(rpc_path).get(no_stream_path))
+        .route("/.well-known/oauth-protected-resource", get(well_known_resource))
+        .route("/.well-known/oauth-protected-resource/mcp", get(well_known_resource))
+        .route("/.well-known/oauth-authorization-server", get(well_known_as))
+        .route("/.well-known/oauth-authorization-server/mcp", get(well_known_as))
+        .route("/register", post(register))
+        .route("/authorize", get(authorize_get))
+        .route("/authorize/poll/{id}", get(authorize_poll))
+        .route("/token", post(token_post))
         .with_state(ctx)
 }
 
@@ -574,7 +1166,8 @@ pub async fn serve(paths: crate::paths::Paths, host: IpAddr, port: u16) -> Resul
         .with_context(|| format!("bind {}", SocketAddr::new(host, port)))?;
     let addr = listener.local_addr()?;
     println!("Kurisu MCP server (KURISU_HOME={})", paths.home.display());
-    println!("  url:   {}", url_for(addr, &token));
+    println!("  url:   http://{addr}/mcp (OAuth sign-in, approved in Telegram by the running daemon)");
+    println!("  legacy: {}", url_for(addr, &token));
     println!("  token: {} (0600)", token_path(&paths.home).display());
     println!("  tools: sessions, send, read, peers (send acts as the owner's own message)");
     let app = router(paths.home.clone(), token, addr);
@@ -612,6 +1205,7 @@ mod tests {
             home: home.to_path_buf(),
             token: Arc::new(fake_token()),
             allowed_hosts: Arc::new(vec!["127.0.0.1:8793".into(), "localhost:8793".into()]),
+            base: Arc::new("http://127.0.0.1:8793".into()),
         }
     }
 
@@ -757,7 +1351,7 @@ mod tests {
         let text = status_text(&running);
         assert!(text.contains("state: running"), "{text}");
         assert!(text.contains("100.118.224.35:8793"), "{text}");
-        assert!(text.contains("token: /srv/kurisu/mcp-server-token (0600)"), "{text}");
+        assert!(text.contains("legacy secret file: /srv/kurisu/mcp-server-token (0600)"), "{text}");
         assert!(text.contains("pid: 4242"), "{text}");
         assert!(text.contains("uptime: 1h 02m"), "{text}");
         // Masked: the first 8 characters, then an ellipsis. The token itself never appears.
@@ -892,5 +1486,265 @@ mod tests {
 
         served.abort();
         daemon.abort();
+    }
+
+    // ------------------------------------------------------------ OAuth
+
+    struct Srv {
+        addr: SocketAddr,
+        home: tempfile::TempDir,
+        served: tokio::task::JoinHandle<()>,
+        daemon: tokio::task::JoinHandle<()>,
+        client: reqwest::Client,
+    }
+
+    impl Drop for Srv {
+        fn drop(&mut self) {
+            self.served.abort();
+            self.daemon.abort();
+        }
+    }
+
+    async fn srv() -> Srv {
+        let home = home();
+        let paths = crate::paths::Paths { home: home.path().to_path_buf() };
+        let daemon = fake_daemon(paths.socket());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(home.path().to_path_buf(), fake_token(), addr);
+        let served = tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        Srv { addr, home, served, daemon, client }
+    }
+
+    const VERIFIER: &str = "a-test-verifier-that-is-long-enough-for-pkce-0123456789";
+    const REDIRECT: &str = "http://127.0.0.1:33418/callback";
+
+    impl Srv {
+        fn url(&self, p: &str) -> String { format!("http://{}{p}", self.addr) }
+
+        async fn register(&self) -> String {
+            let r = self.client.post(self.url("/register"))
+                .json(&json!({"client_name": "Test Client", "redirect_uris": [REDIRECT]})).send().await.unwrap();
+            assert_eq!(r.status(), 201);
+            let v: Value = r.json().await.unwrap();
+            assert_eq!(v["token_endpoint_auth_method"], "none");
+            assert!(v.get("client_secret").is_none());
+            v["client_id"].as_str().unwrap().to_string()
+        }
+
+        /// GET /authorize; returns (status, pending id scraped from the page).
+        async fn authorize(&self, client_id: &str, redirect: &str) -> (u16, Option<String>) {
+            let q = crate::oauth::form_encode(&[("response_type", "code"), ("client_id", client_id), ("redirect_uri", redirect),
+                ("state", "st8"), ("code_challenge", &crate::oauth::pkce_challenge(VERIFIER)), ("code_challenge_method", "S256"),
+                ("scope", "mcp"), ("resource", &self.url("/mcp"))]);
+            let r = self.client.get(self.url(&format!("/authorize?{q}"))).send().await.unwrap();
+            let status = r.status().as_u16();
+            let body = r.text().await.unwrap();
+            let id = body.split("const id=\"").nth(1).map(|t| t.split('"').next().unwrap().to_string());
+            (status, id)
+        }
+
+        async fn poll(&self, id: &str) -> Value {
+            self.client.get(self.url(&format!("/authorize/poll/{id}"))).send().await.unwrap().json().await.unwrap()
+        }
+
+        async fn token(&self, form: &[(&str, &str)]) -> (u16, Value) {
+            let r = self.client.post(self.url("/token")).header("content-type", "application/x-www-form-urlencoded")
+                .body(crate::oauth::form_encode(form)).send().await.unwrap();
+            (r.status().as_u16(), r.json().await.unwrap())
+        }
+
+        /// register -> authorize -> approve -> poll; returns (client_id, code).
+        async fn approved_code(&self) -> (String, String) {
+            let cid = self.register().await;
+            let (st, id) = self.authorize(&cid, REDIRECT).await;
+            assert_eq!(st, 200);
+            let id = id.expect("pending id in the page");
+            assert_eq!(self.poll(&id).await["state"], "pending");
+            assert_eq!(oauth_decide(self.home.path(), &id, true).unwrap(), "Test Client");
+            assert!(oauth_decide(self.home.path(), &id, true).is_err(), "answered once only");
+            let p = self.poll(&id).await;
+            assert_eq!(p["state"], "approved");
+            let redirect = p["redirect"].as_str().unwrap();
+            assert!(redirect.starts_with(&format!("{REDIRECT}?code=")), "{redirect}");
+            assert!(redirect.ends_with("&state=st8"), "{redirect}");
+            let code = redirect.split("code=").nth(1).unwrap().split('&').next().unwrap().to_string();
+            (cid, code)
+        }
+
+        async fn list_tools(&self, bearer: &str) -> reqwest::Response {
+            self.client.post(self.url("/mcp")).header("authorization", format!("Bearer {bearer}"))
+                .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).send().await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_discovery_is_public_and_well_formed() {
+        let s = srv().await;
+        let base = s.url("");
+        let r = s.client.post(s.url("/mcp")).json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        let www = r.headers()["www-authenticate"].to_str().unwrap().to_string();
+        assert_eq!(www, format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\""));
+        assert_eq!(s.client.get(s.url("/mcp")).send().await.unwrap().status(), 401);
+        for p in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"] {
+            let v: Value = s.client.get(s.url(p)).send().await.unwrap().json().await.unwrap();
+            assert_eq!(v["resource"], format!("{base}/mcp"), "{p}");
+            assert_eq!(v["authorization_servers"], json!([base]));
+            assert_eq!(v["scopes_supported"], json!(["mcp"]));
+            assert_eq!(v["bearer_methods_supported"], json!(["header"]));
+        }
+        for p in ["/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/mcp"] {
+            let v: Value = s.client.get(s.url(p)).send().await.unwrap().json().await.unwrap();
+            assert_eq!(v["issuer"], base, "{p}");
+            assert_eq!(v["authorization_endpoint"], format!("{base}/authorize"));
+            assert_eq!(v["token_endpoint"], format!("{base}/token"));
+            assert_eq!(v["registration_endpoint"], format!("{base}/register"));
+            assert_eq!(v["response_types_supported"], json!(["code"]));
+            assert_eq!(v["grant_types_supported"], json!(["authorization_code", "refresh_token"]));
+            assert_eq!(v["code_challenge_methods_supported"], json!(["S256"]));
+            assert_eq!(v["token_endpoint_auth_methods_supported"], json!(["none"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_happy_path_issues_a_token_that_lists_tools_and_refreshes() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = srv().await;
+        let (cid, code) = s.approved_code().await;
+        let (st, tok) = s.token(&[("grant_type", "authorization_code"), ("code", &code), ("redirect_uri", REDIRECT),
+                                  ("client_id", &cid), ("code_verifier", VERIFIER)]).await;
+        assert_eq!(st, 200, "{tok}");
+        assert_eq!(tok["token_type"], "Bearer");
+        assert_eq!(tok["scope"], "mcp");
+        assert!(tok["expires_in"].as_i64().unwrap() > 0);
+        let access = tok["access_token"].as_str().unwrap().to_string();
+        assert_eq!(access.len(), 64);
+        let r = s.list_tools(&access).await;
+        assert_eq!(r.status(), 200);
+        let v: Value = r.json().await.unwrap();
+        let names: Vec<&str> = v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["sessions", "peers", "send", "read"]);
+        for f in [CLIENTS_FILE, TOKENS_FILE] {
+            let mode = std::fs::metadata(s.home.path().join(f)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{f}");
+        }
+        let stored = std::fs::read_to_string(s.home.path().join(TOKENS_FILE)).unwrap();
+        assert!(!stored.contains(&access), "tokens are stored hashed");
+        // Status card lists the client; refresh rotates; revoke signs it out.
+        assert_eq!(oauth_clients(s.home.path())[0]["client_name"], "Test Client");
+        let (st, re) = s.token(&[("grant_type", "refresh_token"), ("refresh_token", tok["refresh_token"].as_str().unwrap()), ("client_id", &cid)]).await;
+        assert_eq!(st, 200, "{re}");
+        assert_eq!(s.list_tools(&access).await.status(), 401, "the old access token is rotated out");
+        let fresh = re["access_token"].as_str().unwrap().to_string();
+        assert_eq!(s.list_tools(&fresh).await.status(), 200);
+        let (st, _) = s.token(&[("grant_type", "refresh_token"), ("refresh_token", tok["refresh_token"].as_str().unwrap()), ("client_id", &cid)]).await;
+        assert_eq!(st, 400, "a refresh token is single-use");
+        assert_eq!(oauth_revoke(s.home.path(), Some(&cid)).unwrap(), 1);
+        assert_eq!(s.list_tools(&fresh).await.status(), 401);
+        assert_eq!(oauth_clients(s.home.path()), json!([]));
+    }
+
+    #[tokio::test]
+    async fn oauth_refuses_bad_verifier_reused_code_unknown_client_and_wrong_redirect() {
+        let s = srv().await;
+        // Wrong verifier: invalid_grant, and the code is spent.
+        let (cid, code) = s.approved_code().await;
+        let base = |c: &str| vec![("grant_type", "authorization_code".to_string()), ("code", c.to_string()),
+                                  ("redirect_uri", REDIRECT.to_string()), ("client_id", cid.clone())];
+        let mut f = base(&code);
+        f.push(("code_verifier", "wrong-verifier-wrong-verifier-wrong-verifier-000".into()));
+        let ff: Vec<(&str, &str)> = f.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let (st, v) = s.token(&ff).await;
+        assert_eq!((st, v["error"].as_str()), (400, Some("invalid_grant")));
+        // Reused code: the first exchange works, the second is invalid_grant.
+        let (cid2, code2) = s.approved_code().await;
+        let good = [("grant_type", "authorization_code"), ("code", code2.as_str()), ("redirect_uri", REDIRECT),
+                    ("client_id", cid2.as_str()), ("code_verifier", VERIFIER)];
+        assert_eq!(s.token(&good).await.0, 200);
+        let (st, v) = s.token(&good).await;
+        assert_eq!((st, v["error"].as_str()), (400, Some("invalid_grant")));
+        // Unknown client at /token: invalid_client 401; at /authorize: an error page, no redirect.
+        let (st, v) = s.token(&[("grant_type", "authorization_code"), ("code", "x"), ("client_id", "nope"), ("code_verifier", VERIFIER)]).await;
+        assert_eq!((st, v["error"].as_str()), (401, Some("invalid_client")));
+        assert_eq!(s.authorize("nope", REDIRECT).await, (400, None));
+        // Mismatched redirect: unregistered host is refused at /authorize; a loopback
+        // port change is allowed (RFC 8252), but /token must then repeat it exactly.
+        let cid3 = s.register().await;
+        assert_eq!(s.authorize(&cid3, "http://evil.example/callback").await.0, 400);
+        assert_eq!(s.authorize(&cid3, "http://127.0.0.1:33418/other").await.0, 400);
+        let (st, id) = s.authorize(&cid3, "http://127.0.0.1:40000/callback").await;
+        assert_eq!(st, 200);
+        let id = id.unwrap();
+        oauth_decide(s.home.path(), &id, true).unwrap();
+        let p = s.poll(&id).await;
+        let code3 = p["redirect"].as_str().unwrap().split("code=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let (st, v) = s.token(&[("grant_type", "authorization_code"), ("code", &code3), ("redirect_uri", REDIRECT),
+                                ("client_id", &cid3), ("code_verifier", VERIFIER)]).await;
+        assert_eq!((st, v["error"].as_str()), (400, Some("invalid_grant")));
+        // Registration refuses plain http off loopback.
+        let r = s.client.post(s.url("/register")).json(&json!({"redirect_uris": ["http://evil.example/cb"]})).send().await.unwrap();
+        assert_eq!(r.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn oauth_denied_expired_token_and_legacy_path_token() {
+        let s = srv().await;
+        // Denied: the page is sent back to the client with access_denied.
+        let cid = s.register().await;
+        let (_, id) = s.authorize(&cid, REDIRECT).await;
+        let id = id.unwrap();
+        oauth_decide(s.home.path(), &id, false).unwrap();
+        let p = s.poll(&id).await;
+        assert_eq!(p["state"], "denied");
+        assert_eq!(p["redirect"], format!("{REDIRECT}?error=access_denied&error_description=the+owner+denied+the+sign-in&state=st8"));
+        assert_eq!(s.poll("unknown-id").await["state"], "expired");
+        // Expired access token: 401 with the same WWW-Authenticate.
+        let (cid, code) = s.approved_code().await;
+        let (_, tok) = s.token(&[("grant_type", "authorization_code"), ("code", &code), ("redirect_uri", REDIRECT),
+                                 ("client_id", &cid), ("code_verifier", VERIFIER)]).await;
+        let access = tok["access_token"].as_str().unwrap();
+        assert_eq!(s.list_tools(access).await.status(), 200);
+        with_file(s.home.path(), TOKENS_FILE, |m| for t in m.values_mut() { t["expires_at"] = json!(now_s() - 1); }).unwrap();
+        let r = s.list_tools(access).await;
+        assert_eq!(r.status(), 401);
+        assert!(r.headers()["www-authenticate"].to_str().unwrap().contains("resource_metadata="));
+        assert_eq!(s.list_tools("f".repeat(64).as_str()).await.status(), 401, "unknown token");
+        // Back-compat: the static secret still works in the path and as a bearer.
+        let r = s.client.post(s.url(&format!("/mcp/{}", fake_token())))
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(s.list_tools(&fake_token()).await.status(), 200);
+    }
+
+    #[test]
+    fn oauth_helpers_parse_forms_and_urls() {
+        let f = form_decode("a=1&b=x%20y+z&c=%2Fp%3F&d");
+        assert_eq!(f["a"], "1");
+        assert_eq!(f["b"], "x y z");
+        assert_eq!(f["c"], "/p?");
+        assert_eq!(f["d"], "");
+        assert!(redirect_allowed("http://localhost:1234/cb"));
+        assert!(redirect_allowed("http://[::1]:1/cb"));
+        assert!(redirect_allowed("https://example.com/cb"));
+        assert!(!redirect_allowed("http://example.com/cb"));
+        assert!(!redirect_allowed("javascript:alert(1)"));
+        assert!(!redirect_allowed("http://127.0.0.1@evil.com/"));
+        assert_eq!(redirect_host("http://127.0.0.1:33418/callback"), "127.0.0.1:33418");
+        assert_eq!(with_query("http://x/cb?a=1", &[("code", "c"), ("state", "")]), "http://x/cb?a=1&code=c");
+    }
+
+    #[test]
+    fn status_card_offers_the_plain_url_and_sign_out_buttons() {
+        let st = json!({"listening": true, "listen": "127.0.0.1:8793", "sign_in_url": "http://127.0.0.1:8793/mcp",
+                        "url": "http://127.0.0.1:8793/mcp/00000000…",
+                        "oauth_clients": [{"client_id": "abc123", "client_name": "Claude Code"}]});
+        let text = status_text(&st);
+        assert!(text.contains("url: http://127.0.0.1:8793/mcp\n"), "{text}");
+        assert!(text.contains("sign-in"), "{text}");
+        assert!(text.contains("signed-in clients: Claude Code"), "{text}");
+        let kb = keyboard(&st);
+        assert_eq!(kb["inline_keyboard"][1][0]["callback_data"], "msv:rv:abc123");
     }
 }

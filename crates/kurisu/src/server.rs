@@ -3434,7 +3434,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                           "total": total, "messages": page, "has_more": more,
                           "first_seq": first, "last_seq": last}))
             }
-            "remote_reload" | "remote_link" | "remote_bind" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" | "mcp_server_status" | "mcp_server_enable" | "mcp_server_disable" | "mcp_server_url" if caller.is_some() => {
+            "remote_reload" | "remote_link" | "remote_bind" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" | "mcp_server_status" | "mcp_server_enable" | "mcp_server_disable" | "mcp_server_url" | "mcp_oauth_card" | "mcp_oauth_decide" | "mcp_oauth_revoke" if caller.is_some() => {
                 bail!("permission denied: only the user manages remote access")
             }
             "remote_link" => {
@@ -3576,6 +3576,27 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                 Ok(json!({"was_on": was, "status": self.mcp_server_status().await}))
             }
             "mcp_server_url" => self.mcp_server_url().await,
+            // Outward MCP OAuth: the listener asks for the owner's card; the card's
+            // buttons decide; the status card signs clients out. User-only (above).
+            "mcp_oauth_card" => {
+                let expires = req.get("expires_at").and_then(Value::as_i64).unwrap_or(0);
+                self.telegram.oauth_card(&s("id")?, &s("client_name")?, &s("redirect_host")?,
+                                         &opt("scope").unwrap_or_else(|| "mcp".into()), expires).await?;
+                Ok(json!({"sent": true}))
+            }
+            "mcp_oauth_decide" => {
+                let approve = req.get("approve").and_then(Value::as_bool).unwrap_or(false);
+                let name = crate::mcp_out::oauth_decide(&self.paths.home, &s("id")?, approve)?;
+                self.audit("user", "mcp", if approve { "mcp_oauth_approved" } else { "mcp_oauth_denied" },
+                           &format!("outward MCP sign-in for {name}")).await;
+                Ok(json!({"client_name": name, "approved": approve}))
+            }
+            "mcp_oauth_revoke" => {
+                let id = opt("client_id");
+                let n = crate::mcp_out::oauth_revoke(&self.paths.home, id.as_deref())?;
+                self.audit("user", "mcp", "mcp_oauth_revoked", &format!("outward MCP sign-out {} ({n} tokens)", id.as_deref().unwrap_or("all"))).await;
+                Ok(json!({"removed": n}))
+            }
             "browser_status" => Ok(json!({"running": self.browser.running().await, "line": crate::browser::status_line(&self.paths.home, Some(self.browser.running().await))})),
             "browser_reload" => {
                 if caller.is_some() {
@@ -4780,6 +4801,8 @@ it has not been sent anything yet" }}))
             "token_path": crate::mcp_out::token_path(&self.paths.home),
             "token_mode": crate::mcp_out::token_mode(&self.paths.home),
             "url": url,
+            "sign_in_url": addr.map(|a| format!("http://{a}/mcp")).unwrap_or_default(),
+            "oauth_clients": crate::mcp_out::oauth_clients(&self.paths.home),
             "note": note,
         });
         if out["listening"] == json!(true) {

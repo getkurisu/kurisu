@@ -615,6 +615,33 @@ impl Channel {
         Ok(())
     }
 
+    /// An outward-MCP sign-in card: which client, where its code will go, the scope.
+    /// The code itself never comes here; the owner's browser carries it to the client.
+    pub async fn oauth_card(&self, id: &str, client_name: &str, redirect_host: &str, scope: &str, expires_unix: i64) -> Result<()> {
+        let b = self.bridge().await.ok_or_else(|| anyhow::anyhow!("the Telegram channel is not running"))?;
+        let hm = chrono::DateTime::from_timestamp(expires_unix, 0).map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default();
+        let text = format!("🔌 MCP sign-in request\nclient: {client_name}\nreturns to: {redirect_host}\nscope: {scope} (sessions, peers, send as you, read)\n\n\
+Approve only if you just started this sign-in.\n⌛ Expires at {hm}");
+        let markup = json!({"inline_keyboard": [[{"text": "✅ Approve", "callback_data": format!("moa:{id}:a")},
+                                                 {"text": "❌ Deny", "callback_data": format!("moa:{id}:d")}]]});
+        let dm = b.dm();
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(10),
+            b.send_text_with(&dm, &b.chat_id(), &text, Some(markup), Some(0))).await;
+        let mid = match sent {
+            Ok(r) => r?,
+            Err(_) => return Err(anyhow::anyhow!("Telegram did not accept the sign-in card in 10 s")),
+        }.ok_or_else(|| anyhow::anyhow!("Telegram returned no message id"))?;
+        b.with_state(|st| {
+            let c = st.entry("oauth_cards").or_insert(json!({}));
+            if !c.is_object() {
+                *c = json!({});
+            }
+            c[id] = json!({"chat_id": b.chat_id(), "message_id": mid, "text": text});
+        });
+        b.save_state();
+        Ok(())
+    }
+
     /// Close a remote-access card with its outcome (expired, replaced, closed).
     pub async fn pair_close(&self, attempt: &str, outcome: &str) {
         if let Some(b) = self.bridge().await {

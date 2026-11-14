@@ -2519,6 +2519,12 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                     v["token_path"].as_str().unwrap_or(""))).await?;
                 return Ok(());
             }
+            d if d.starts_with("msv:rv:") => {
+                let id = &d["msv:rv:".len()..];
+                let r = self.k(json!({"op": "mcp_oauth_revoke", "client_id": id})).await?;
+                self.answer_callback(callback_id, Some("Signed out")).await;
+                format!("🚫 Signed out: {} token(s) removed; that client must sign in again.", r["removed"].as_u64().unwrap_or(0))
+            }
             _ => {
                 self.answer_callback(callback_id, Some("MCP server card expired; send /mcp_server again")).await;
                 return Ok(());
@@ -2805,6 +2811,8 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             self.handle_terminal_callback(&ctx, cid, message, data).await.map_err(guard("Terminal failed"))
         } else if data.starts_with("mcp:") {
             self.handle_mcp_callback(&ctx, cid, message, data).await.map_err(guard("MCP action failed"))
+        } else if data.starts_with("moa:") {
+            self.handle_oauth_callback(&ctx, cid, data).await.map_err(guard("Sign-in approval failed"))
         } else if data.starts_with("msv:") {
             self.handle_mcp_server_callback(&ctx, cid, message, data).await.map_err(guard("MCP server action failed"))
         } else if data.starts_with("cmp:") {
