@@ -440,6 +440,43 @@ Each link still needs your approval here.\n{}", if lb_installed { "" } else { "d
         Ok(())
     }
 
+    /// Outward MCP sign-in card: moa:<id>:a / moa:<id>:d. Owner DM only.
+    pub(crate) async fn handle_oauth_callback(&self, ctx: &Ctx, cid: &Value, data: &str) -> Result<()> {
+        if !self.is_owner_dm(&ctx.chat_id) {
+            self.answer_callback(cid, Some("Only the owner's DM can approve a sign-in")).await;
+            return Ok(());
+        }
+        let parts: Vec<&str> = data.splitn(3, ':').collect();
+        let (id, action) = (parts.get(1).copied().unwrap_or(""), parts.get(2).copied().unwrap_or(""));
+        if action != "a" && action != "d" {
+            self.answer_callback(cid, Some("Unknown action")).await;
+            return Ok(());
+        }
+        let outcome = match self.k(json!({"op": "mcp_oauth_decide", "id": id, "approve": action == "a"})).await {
+            Err(e) => {
+                self.alert_callback(cid, &format!("⌛ {e}")).await;
+                format!("⌛ {e}")
+            }
+            Ok(_) if action == "a" => {
+                self.answer_callback(cid, Some("Approved")).await;
+                "✅ Approved — the browser hands the sign-in back to the client.".to_string()
+            }
+            Ok(_) => {
+                self.answer_callback(cid, Some("Denied")).await;
+                "❌ Denied.".to_string()
+            }
+        };
+        if let Some(card) = self.cards_remove("oauth_cards", id) {
+            self.save_state();
+            let text = format!("{}\n\n{outcome}", card["text"].as_str().unwrap_or("MCP sign-in request"));
+            if let Err(e) = self.tg1("editMessageText", json!({"chat_id": card["chat_id"], "message_id": card["message_id"], "text": text,
+                                                             "disable_web_page_preview": true, "reply_markup": {"inline_keyboard": []}})).await {
+                log(format!("sign-in card edit failed: {e}"));
+            }
+        }
+        Ok(())
+    }
+
     fn cards_get(&self, kind: &str, key: &str) -> Option<Value> {
         self.with_state(|st| st.get(kind).and_then(|c| c.get(key)).cloned())
     }
