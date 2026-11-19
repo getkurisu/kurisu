@@ -1096,6 +1096,10 @@ async fn proxy(State(web): State<Web>, req: axum::extract::Request) -> Response 
     };
     server.browser.touch().await;
     let path = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
+    // lb's Kurisu skin is opt-in (v0.4.22+): a bare page load gets ?theme=kurisu.
+    if path == "/" && req.method() == axum::http::Method::GET {
+        return axum::response::Redirect::to("/?theme=kurisu").into_response();
+    }
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut out = reqwest::Client::new().request(method, format!("{}{path}", cfg.server_url())).timeout(Duration::from_secs(60));
     for (k, v) in req.headers() {
@@ -1154,7 +1158,7 @@ body{font:16px system-ui;background:var(--bg2);color:var(--fg);margin:0;padding:
 <script>const texts={denied:'Denied in Telegram. This link is dead.',expired:'No approval in time. This link is dead; send /browser again.',
 replaced:'This page was replaced by a newer attempt.',closed:'Closed.',none:'Not paired.'};
 async function poll(){try{const s=(await (await fetch('/_ku/state',{cache:'no-store'})).json()).state;
-if(s==='approved'){location.replace('/');return}if(s!=='pending'){document.getElementById('msg').textContent=texts[s]||s;return}}catch(e){}setTimeout(poll,1500)}
+if(s==='approved'){location.replace('/?theme=kurisu');return}if(s!=='pending'){document.getElementById('msg').textContent=texts[s]||s;return}}catch(e){}setTimeout(poll,1500)}
 poll();</script></body></html>"##;
     secure_headers(Html(themed(&html.replace("__CODE__", code))).into_response())
 }
