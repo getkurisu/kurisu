@@ -19,12 +19,13 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 /// The lb release Kurisu targets: per-session tabs (live-browser PR #39) plus the
-/// Kurisu-themed live view (`/browser` matches the `ku web` chat theme). `ku browser
+/// Kurisu-themed live view (`/browser` opens it with `?theme=kurisu`, which since
+/// v0.4.22 is opt-in; lb's default look is its own). `ku browser
 /// setup` uses an installed lb at least this new, else downloads this release.
-pub const LB_PINNED: &str = "v0.4.20";
+pub const LB_PINNED: &str = "v0.4.22";
 /// The commit of LB_PINNED, built from source when the release cannot be downloaded
 /// (e.g. no release asset for this OS/arch).
-pub const LB_PINNED_COMMIT: &str = "c2861f9c4b7f";
+pub const LB_PINNED_COMMIT: &str = "1a51fb8dcbaa";
 pub const LB_REPO: &str = "https://github.com/anslwy/live-browser";
 pub const IDLE: Duration = Duration::from_secs(30 * 60);
 
@@ -610,8 +611,8 @@ mod tests {
 
     #[test]
     fn lb_version_floor() {
-        assert!(at_least("0.4.20", LB_PINNED) && at_least("lb 0.4.21", "v0.4.20") && at_least("0.5.0", LB_PINNED));
-        assert!(!at_least("0.4.19", LB_PINNED) && !at_least("lb 0.4.9", "v0.4.20") && !at_least("", "v0.4.20"));
+        assert!(at_least("0.4.22", LB_PINNED) && at_least("lb 0.4.21", "v0.4.20") && at_least("0.5.0", LB_PINNED));
+        assert!(!at_least("0.4.21", LB_PINNED) && !at_least("lb 0.4.9", "v0.4.20") && !at_least("", "v0.4.20"));
     }
 
     #[test]
@@ -660,10 +661,10 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             p
         };
-        let old = fake("lb-old", "0.4.19");
+        let old = fake("lb-old", "0.4.21");
         let pinned = fake("lb-pin", &LB_PINNED[1..]);
-        assert_eq!(lb_version(&old).as_deref(), Some("0.4.19"));
-        assert!(!pin_ok(lb_version(&old).as_deref()), "0.4.19 must not count as the v0.4.20 pin");
+        assert_eq!(lb_version(&old).as_deref(), Some("0.4.21"));
+        assert!(!pin_ok(lb_version(&old).as_deref()), "0.4.21 must not count as the v0.4.22 pin");
         assert!(pin_ok(lb_version(&pinned).as_deref()));
         assert!(pin_ok(Some("0.5.0")) && !pin_ok(Some("0.3.9")) && !pin_ok(None));
 
@@ -671,7 +672,7 @@ mod tests {
                            listen: "127.0.0.1:8793".into(), public_url: None, max_tabs: None, tab_idle_secs: None, isolated: false };
         crate::telegram::write_private(&config_path(d.path()), &serde_json::to_vec(&cfg).unwrap()).unwrap();
         let line = status_line(d.path(), None);
-        assert!(line.contains("lb 0.4.19") && line.contains(LB_PINNED), "status must name the pin: {line}");
+        assert!(line.contains("lb 0.4.21") && line.contains(LB_PINNED), "status must name the pin: {line}");
     }
 
     /// Only `<home>/lb/live-browser-<pin>-<asset>/lb` counts as an already
